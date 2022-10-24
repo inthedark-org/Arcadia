@@ -1,3 +1,5 @@
+#![allow(clippy::pedantic)]
+
 pub mod checks;
 pub mod manage;
 pub mod maps;
@@ -5,6 +7,7 @@ pub mod public;
 pub mod search;
 pub mod staff;
 pub mod types;
+pub mod staffapps;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const GIT_SHA: &str = env!("VERGEN_GIT_SHA");

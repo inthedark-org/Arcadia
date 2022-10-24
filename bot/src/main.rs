@@ -1,4 +1,3 @@
-use std::fmt::Write;
 use std::{sync::Arc, time::Duration};
 
 use dotenv::dotenv;
@@ -8,19 +7,18 @@ use sqlx::postgres::PgPoolOptions;
 
 use poise::serenity_prelude::{ChannelId, UserId};
 
-use poise::Command;
-
 mod _checks;
 mod _onboarding;
 mod _utils;
 mod admin;
+mod botowners;
 mod explain;
+mod help;
 mod search;
 mod staff;
 mod stats;
 mod testing;
 mod tests;
-mod botowners;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -44,6 +42,51 @@ async fn age(
     Ok(())
 }
 
+/// Test followup
+#[poise::command(slash_command, prefix_command)]
+async fn actf(ctx: Context<'_>) -> Result<(), Error> {
+    ctx.say("initial response").await?;
+    ctx.say("followup").await?;
+
+    Ok(())
+}
+
+/// Test await_component_interaction
+#[poise::command(slash_command, prefix_command)]
+async fn act(ctx: Context<'_>) -> Result<(), Error> {
+    let msg = ctx
+        .send(|m| {
+            m.content("Test").components(|c| {
+                c.create_action_row(|f| {
+                    f.create_button(|b| {
+                        b.label("A")
+                            .custom_id("abc")
+                            .style(serenity::ButtonStyle::Danger)
+                    })
+                })
+            })
+        })
+        .await?
+        .into_message()
+        .await?;
+
+    let interaction = msg
+        .await_component_interaction(ctx.discord())
+        .author_id(ctx.author().id)
+        .await;
+
+    if let Some(m) = &interaction {
+        let id = &m.data.custom_id;
+        info!("Received interaction: {}", id);
+        ctx.say(format!("Received interaction: {}", id)).await?;
+    } else {
+        info!("No interaction");
+        ctx.say("No interaction received").await?;
+    }
+
+    Ok(())
+}
+
 #[poise::command(prefix_command)]
 async fn register(ctx: Context<'_>) -> Result<(), Error> {
     poise::builtins::register_application_commands_buttons(ctx).await?;
@@ -55,7 +98,7 @@ async fn on_error(error: poise::FrameworkError<'_, Data, Error>) {
     // They are many errors that can occur, so we only handle the ones we want to customize
     // and forward the rest to the default handler
     match error {
-        poise::FrameworkError::Setup { error } => panic!("Failed to start bot: {:?}", error),
+        poise::FrameworkError::Setup { error, .. } => panic!("Failed to start bot: {:?}", error),
         poise::FrameworkError::Command { error, ctx } => {
             error!("Error in command `{}`: {:?}", ctx.command().name, error,);
             ctx.say(format!(
@@ -66,8 +109,13 @@ async fn on_error(error: poise::FrameworkError<'_, Data, Error>) {
             .unwrap();
         }
         poise::FrameworkError::CommandCheckFailed { error, ctx } => {
-            error!("Error in command `{}`: {:?}", ctx.command().name, error,);
+            error!(
+                "[Possible] error in command `{}`: {:?}",
+                ctx.command().name,
+                error,
+            );
             if let Some(error) = error {
+                error!("Error in command `{}`: {:?}", ctx.command().name, error,);
                 ctx.say(format!(
                     "Whoa there, do you have permission to do this?: {}",
                     error
@@ -89,7 +137,7 @@ async fn on_error(error: poise::FrameworkError<'_, Data, Error>) {
 }
 
 #[poise::command(track_edits, prefix_command, slash_command)]
-async fn help(
+async fn simplehelp(
     ctx: Context<'_>,
     #[description = "Specific command to show help about"]
     #[autocomplete = "poise::builtins::autocomplete_command"]
@@ -104,46 +152,6 @@ async fn help(
         },
     )
     .await?;
-    Ok(())
-}
-
-async fn _embed_help(
-    ctx: poise::FrameworkContext<'_, Data, Error>,
-    page: u32,
-) -> Result<String, Error> {
-    let mut categories =
-        libavacado::maps::OrderedMap::<Option<&str>, Vec<&Command<Data, Error>>>::new();
-    for cmd in &ctx.options().commands {
-        categories
-            .get_or_insert_with(cmd.category, Vec::new)
-            .push(cmd);
-    }
-
-    let mut menu = format!("**Page:** {}", page);
-    for (category_name, commands) in categories {
-        menu += category_name.unwrap_or("Commands");
-        menu += ":\n";
-        for command in commands {
-            if command.hide_in_help {
-                continue;
-            }
-
-            let _ = writeln!(
-                menu,
-                "/{cmd_name} | ibb!{cmd_name} - {desc}",
-                cmd_name = command.name,
-                desc = command.description.as_deref().unwrap_or("")
-            );
-        }
-    }
-
-    Ok(menu)
-}
-
-#[poise::command(track_edits, prefix_command, slash_command)]
-async fn new_help(ctx: Context<'_>) -> Result<(), Error> {
-    _embed_help(ctx.framework(), 1).await?;
-
     Ok(())
 }
 
@@ -162,6 +170,9 @@ async fn event_listener(
         .unwrap();
 
     match event {
+        poise::Event::InteractionCreate { interaction } => {
+            info!("Interaction received: {:?}", interaction.id());
+        }
         poise::Event::Ready { data_about_bot } => {
             info!(
                 "{} is ready! Doing some minor DB fixes",
@@ -176,16 +187,21 @@ async fn event_listener(
             let _ctx = ctx.to_owned();
             let pool = user_data.pool.clone();
 
-            tokio::task::spawn(async move {
-                autounclaim(pool, _ctx.http, _ctx.cache).await;
-            });
+            let autounclaim_events =
+                std::env::var("AUTOUNCLAIM_EVENTS").unwrap_or_else(|_| "true".to_string());
+
+            if autounclaim_events == "true" {
+                tokio::task::spawn(async move {
+                    autounclaim(pool, _ctx.http, _ctx.cache).await;
+                });
+            }
         }
         poise::Event::CacheReady { guilds } => {
             info!("Cache ready with {} guilds", guilds.len());
         }
         poise::Event::GuildMemberAddition { new_member } => {
             if new_member.guild_id.0 == main_server && new_member.user.bot {
-                // Check if new memebr is in testing server
+                // Check if new member is in testing server
                 let member =
                     ctx.cache
                         .member_field(GuildId(testing_server), new_member.user.id, |m| m.user.id);
@@ -209,7 +225,7 @@ async fn autounclaim(
     http: Arc<serenity::http::Http>,
     cache: Arc<serenity::Cache>,
 ) {
-    let mut interval = tokio::time::interval(Duration::from_millis(10000));
+    let mut interval = tokio::time::interval(Duration::from_millis(30000));
 
     let lounge_channel_id = ChannelId(
         std::env::var("LOUNGE_CHANNEL")
@@ -475,8 +491,60 @@ async fn main() {
 
     dotenv().ok();
 
-    let framework = poise::Framework::builder()
-        .options(poise::FrameworkOptions {
+    // proxy url is always http://localhost:3219
+    let mut proxy_url = "http://localhost:3219".to_string();
+    if let Ok(v) = std::env::var("PROXY_URL") {
+        info!("Setting proxy url to {}", v);
+        proxy_url = v;
+    }
+
+    info!("Proxy URL: {}", proxy_url);
+
+    // http_pre is for getting app_info etc., http is for poise framework
+    let http_pre =
+        serenity::HttpBuilder::new(std::env::var("DISCORD_TOKEN").expect("missing DISCORD_TOKEN"))
+            .proxy(&proxy_url)
+            .expect("proxy error")
+            .ratelimiter_disabled(true)
+            .build();
+    let http =
+        serenity::HttpBuilder::new(std::env::var("DISCORD_TOKEN").expect("missing DISCORD_TOKEN"))
+            .proxy(proxy_url)
+            .expect("proxy error")
+            .ratelimiter_disabled(true)
+            .build();
+
+    let client_builder =
+        serenity::ClientBuilder::new_with_http(http, serenity::GatewayIntents::all());
+
+    // Get the bot's owners and id and convert it to hashset
+    let app_inf = http_pre.get_current_application_info().await.unwrap();
+    let owners = app_inf
+        .team
+        .as_ref()
+        .map(|team| team.members.iter().map(|m| m.user.id).collect())
+        .unwrap_or_else(|| vec![app_inf.owner.id]);
+    let owners = owners.into_iter().collect::<std::collections::HashSet<_>>();
+
+    let framework = poise::Framework::new(
+        client_builder,
+        move |_ctx, _ready, _framework| {
+            Box::pin(async move {
+                Ok(Data {
+                    pool: PgPoolOptions::new()
+                        .max_connections(MAX_CONNECTIONS)
+                        .connect(&std::env::var("DATABASE_URL").expect("missing DATABASE_URL"))
+                        .await
+                        .expect("Could not initialize connection"),
+                    avacado_public: libavacado::public::AvacadoPublic::new(
+                        _ctx.cache.clone(),
+                        _ctx.http.clone(),
+                    ),
+                })
+            })
+        },
+        poise::FrameworkOptions {
+            owners,
             prefix_options: poise::PrefixFrameworkOptions {
                 prefix: Some("ibb!".into()),
                 ..poise::PrefixFrameworkOptions::default()
@@ -486,15 +554,19 @@ async fn main() {
             },
             commands: vec![
                 age(),
+                act(),
+                actf(),
                 register(),
-                help(),
-                new_help(),
+                simplehelp(),
+                help::help(),
                 explain::explainme(),
                 staff::staff(),
                 testing::onboard(),
                 testing::invite(),
                 testing::claim(),
+                testing::claim_context(),
                 testing::unclaim(),
+                testing::unclaim_context(),
                 testing::queue(),
                 testing::approve(),
                 testing::deny(),
@@ -502,10 +574,11 @@ async fn main() {
                 tests::test_staffcheck(),
                 tests::test_admin_dev(),
                 tests::test_admin(),
+                tests::test_poll(),
                 admin::update_field(),
                 admin::votereset(),
                 admin::voteresetall(),
-                admin::approveonboard(),
+                admin::onboardman(),
                 search::searchbots(),
                 stats::stats(),
                 botowners::setstats(),
@@ -524,22 +597,6 @@ async fn main() {
             /// This code is run after every command returns Ok
             post_command: |ctx| {
                 Box::pin(async move {
-                    // Some onboarding things need a post command to be executed
-                    let res = crate::_onboarding::post_command(ctx).await;
-
-                    if let Err(e) = res {
-                        error!("Error while executing onboarding post command: {:?}", e);
-                        if let Err(discord_err) = ctx
-                            .say(
-                                "Onboarding background daemon failed with error: ".to_string()
-                                    + e.to_string().as_str(),
-                            )
-                            .await
-                        {
-                            error!("Error while sending message to user: {:?}", discord_err);
-                        }
-                    }
-
                     info!(
                         "Done executing command {} for user {} ({})...",
                         ctx.command().qualified_name,
@@ -550,24 +607,10 @@ async fn main() {
             },
             on_error: |error| Box::pin(on_error(error)),
             ..Default::default()
-        })
-        .token(std::env::var("DISCORD_TOKEN").expect("missing DISCORD_TOKEN"))
-        .intents(serenity::GatewayIntents::all())
-        .user_data_setup(move |_ctx, _ready, _framework| {
-            Box::pin(async move {
-                Ok(Data {
-                    pool: PgPoolOptions::new()
-                        .max_connections(MAX_CONNECTIONS)
-                        .connect(&std::env::var("DATABASE_URL").expect("missing DATABASE_URL"))
-                        .await
-                        .expect("Could not initialize connection"),
-                    avacado_public: libavacado::public::AvacadoPublic::new(
-                        _ctx.cache.clone(),
-                        _ctx.http.clone(),
-                    ),
-                })
-            })
-        });
+        },
+    )
+    .await
+    .expect("Error");
 
-    framework.run().await.expect("Error");
+    framework.start().await.expect("Error");
 }

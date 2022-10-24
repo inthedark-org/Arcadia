@@ -1,6 +1,8 @@
-use std::sync::Arc;
+use std::{sync::Arc};
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::types::JsonValue;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -21,6 +23,11 @@ pub struct SearchBot {
     pub shards: i32,
     pub votes: i32,
     pub certified: bool,
+    pub r#type: String,
+    pub banner: Option<String>,
+    pub invite_clicks: i32,
+    pub clicks: i32,
+    pub vanity: Option<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -44,4 +51,38 @@ pub struct DiscordUser {
     pub username: String,
     pub discriminator: String,
     pub avatar: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct StaffAppQuestion {
+    pub id: String,
+    pub question: String,
+    pub para: String,
+    pub placeholder: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct StaffPosition {
+    pub info: String,
+    pub open: bool,
+    pub name: String,
+    pub questions: Vec<StaffAppQuestion>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct StaffAppData {
+    pub positions: Vec<String>,
+    pub staff: StaffPosition,
+    pub dev: StaffPosition,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct StaffAppResponse {
+    pub user_id: String,
+    pub answers: JsonValue,
+    pub state: String,
+    pub created_at: DateTime<Utc>,
+    pub likes: Vec<String>,
+    pub dislikes: Vec<String>,
+    pub position: String,
 }

@@ -1,32 +1,60 @@
 use std::time::Duration;
 
-use log::info;
-use poise::serenity_prelude::{ChannelId, Mentionable, Permissions, RoleId};
+use log::{error, info};
+use poise::serenity_prelude::{ChannelId, Mentionable, Permissions, RoleId, UserId};
 
 use poise::serenity_prelude as serenity;
 use serde_json::json;
 
-use serde::Serialize;
+/// Internal function to handle the special-cased staff_guide command
+///
+/// This internally creates a onboarding 'fragment' which is used to ensure that a user isn't peeping into someone elses staff verification code
+///
+/// This fragment is then used by sovngarde to fetch the full code and add it to the guide.
+async fn _handle_staff_guide(ctx: crate::Context<'_>, user_id: String) -> Result<(), crate::Error> {
+    // This is the onboard code user needs to input (random_string@CURRENT_TIME)
+    let onboard_code =
+        libavacado::public::gen_random(64) + "@" + &chrono::Utc::now().timestamp().to_string();
 
-#[derive(Debug, Serialize)]
-struct SurveyModal {
-    analysis: String,
-    thoughts: String,
-    has_onboarded_before: bool,
-    invite: String,
+    // Get first 20 characters of the onboard code as onboard_fragment
+    let onboard_fragment = onboard_code.chars().take(20).collect::<String>();
+
+    // Set onboard code for user
+    let data = ctx.data();
+
+    sqlx::query!(
+        "UPDATE users SET staff_onboard_session_code = $1 WHERE user_id = $2",
+        onboard_code,
+        user_id
+    )
+    .execute(&data.pool)
+    .await?;
+
+    ctx.say(
+        format!(
+            r#"The staff guide can be found at https://seed.infinitybots.gg/sovngarde?svu={uid}@{ocf}. Please **do not** bookmark this page as the URL may change in the future
+            
+Thats a lot isn't it? I'm glad you're ready to take on your first challenge. To get started, **invite ``Ninja Bot`` using ``ibb!invite [ID]`` where [ID] is the ID from the ``queue`` command**, then claim ``Ninja Bot``!
+
+**Note that during onboarding, the *5 digit staff verify code present somewhere in the guide* will be reset every time you run the ``staffguide`` command! Always use the latest command invocation for getting the code**
+            "#,
+            uid = user_id,
+            ocf = onboard_fragment,
+    )).await?;
+
+    Ok(())
 }
 
 /// Tries to check if onboarding is required, returns ``false`` if command should stop
 pub async fn handle_onboarding(
     ctx: crate::Context<'_>,
-    user_id: &str,
     embed: bool,
     reason: Option<&str>, // Only applicable for testing-bot
 ) -> Result<bool, crate::Error> {
-    // Get baisc info from ctx for future use
-    let cmd_name = &ctx.command().name;
+    // Get basic info from ctx for future use
+    let cmd_name = ctx.command().name.as_str();
 
-    let onboard_name = ctx.author().id.to_string();
+    let user_id = ctx.author().id.to_string();
 
     info!("{}", cmd_name);
 
@@ -34,14 +62,56 @@ pub async fn handle_onboarding(
     let discord = ctx.discord();
 
     // Verify staff first
-    let is_staff = crate::_checks::is_any_staff(ctx).await;
-    if is_staff.is_err() {
-        return Ok(true);
-    } else if let Ok(is_staff) = is_staff {
-        if !is_staff {
+    let is_staff = crate::_checks::is_any_staff(ctx).await.unwrap_or_else(|e| {
+        error!("{}", e);
+        false
+    });
+    if !is_staff {
+        // Check if awaiting staff role in main server
+        let main_server = std::env::var("MAIN_SERVER")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+
+        let member = discord.cache.member(main_server, ctx.author().id);
+
+        if member.is_none() {
+            info!("Member not found in main server");
             return Ok(true);
         }
+
+        let member = member.unwrap();
+
+        let awaiting_role = std::env::var("AWAITING_STAFF_ROLE")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+
+        if !member.roles.contains(&RoleId(awaiting_role)) {
+            info!("User is not awaiting staff role");
+            return Ok(true);
+        }
+
+        info!("User is awaiting staff role, adding staff perms and removing old onboarding state for the purpose of onboarding");
+
+        sqlx::query!("UPDATE users SET staff = true WHERE user_id = $1", user_id)
+            .execute(&data.pool)
+            .await?;
+
+        sqlx::query!(
+            "UPDATE users SET staff_onboard_state = 'pending' WHERE user_id = $1 AND staff_onboard_state = 'complete'",
+            user_id
+        )
+        .execute(&data.pool)
+        .await?;
     }
+
+    // Reset old onboards
+    sqlx::query!(
+        "UPDATE users SET staff_onboard_state = 'pending', staff_onboard_last_start_time = NOW() WHERE staff_onboard_state = 'complete' AND staff = true AND NOW() - staff_onboard_last_start_time > interval '1 month'"
+    )
+    .execute(&data.pool)
+    .await?;
 
     // Get onboard state (staff_onboard_state may be used later but is right now None and it will in the future be used to allow retaking of onboarding)
     let onboard_state = {
@@ -55,18 +125,11 @@ pub async fn handle_onboarding(
         res.staff_onboard_state
     };
 
-    // Reset old onboards
-    sqlx::query!(
-        "UPDATE users SET staff_onboard_state = 'pending' WHERE staff_onboard_state = 'complete' AND staff = true AND NOW() - staff_onboard_last_start_time > interval '1 month'"
-    )
-    .execute(&data.pool)
-    .await?;
-
-    // Must be mut so we can change it under some cases
+    // Must be mut so we can change it under some cases, we use a second let to create a let binding
     let mut onboard_state = onboard_state.as_str();
 
     let onboarded = sqlx::query!(
-        "SELECT staff, staff_onboarded, staff_onboard_last_start_time FROM users WHERE user_id = $1",
+        "SELECT staff_onboarded, staff_onboard_last_start_time FROM users WHERE user_id = $1",
         user_id
     )
     .fetch_one(&data.pool)
@@ -78,6 +141,10 @@ pub async fn handle_onboarding(
     }
 
     if onboard_state == "pending-manager-review" {
+        if cmd_name == "queue" {
+            return Ok(true);
+        }
+
         ctx.say(
             "Your onboarding request is pending manager review. Please wait until it is approved.",
         )
@@ -85,9 +152,19 @@ pub async fn handle_onboarding(
         return Ok(false);
     }
 
-    if onboarded.staff_onboarded {
-        info!("{} is already onboarded", user_id);
-    } else if onboarded.staff_onboard_last_start_time.is_none() {
+    if onboard_state == "denied" {
+        if cmd_name == "queue" {
+            return Ok(true);
+        }
+
+        ctx.say(
+            "Your onboarding request was denied. Please contact a manager if you believe this was a mistake.",
+        )
+        .await?;
+        return Ok(false);
+    }
+
+    if onboarded.staff_onboard_last_start_time.is_none() {
         // No onboarding record, so we set it to NOW()
         sqlx::query!(
             "UPDATE users SET staff_onboard_last_start_time = NOW() WHERE user_id = $1",
@@ -113,12 +190,21 @@ pub async fn handle_onboarding(
         onboard_state = "pending";
     }
 
+    if onboard_state == "pending" {
+        // Set macro_time (when the onboarding is first started by the user)
+        sqlx::query!(
+            "UPDATE users SET staff_onboard_macro_time = NOW() WHERE user_id = $1",
+            user_id
+        )
+        .execute(&data.pool)
+        .await?;
+    }
+
     let cur_guild = ctx.guild().unwrap().name;
 
-    if cur_guild.to_lowercase() != onboard_name.to_lowercase() {
+    if cur_guild.to_lowercase() != user_id.to_lowercase() {
         ctx.say("Creating new onboarding server for you!").await?;
 
-        // Reset timer, but here we can't do NOW() exactly as otherwise postgres may fail to see it sooo
         sqlx::query!(
             "UPDATE users SET staff_onboard_last_start_time = NOW() WHERE user_id = $1",
             user_id
@@ -132,33 +218,58 @@ pub async fn handle_onboarding(
         let mut found = false;
 
         for guild in guilds.iter() {
-            let name = guild.name(&discord);
+            let name = guild.name(discord);
 
             if let Some(name) = name {
-                if name.to_lowercase() == onboard_name.to_lowercase() {
-                    // Create new channel
-                    let channel = guild
-                        .create_channel(&discord, |c| {
-                            c.name(
-                                "invite-attempt-".to_string() + &libavacado::public::gen_random(6),
-                            )
-                            .kind(serenity::model::channel::ChannelType::Text)
-                        })
-                        .await?;
+                if name.to_lowercase() == user_id.to_lowercase() {
+                    // Try to find a channel named readme
+                    let mut channel = None;
 
-                    // Create new invite
-                    let invite = channel
+                    for (_, chan) in guild.channels(&discord).await? {
+                        if chan.name() == "readme" {
+                            channel = Some(chan);
+                            break;
+                        }
+                    }
+
+                    if channel.is_none() {
+                        // Delete guild and start over
+                        crate::_utils::delete_leave_guild(&discord.http, &discord.cache, *guild)
+                            .await;
+                        continue;
+                    }
+
+                    let channel = channel.unwrap();
+
+                    // Create DM invite
+                    let dm_invite = channel
                         .create_invite(&discord, |i| {
-                            i.max_age(0).max_uses(0).temporary(false).unique(true)
+                            i.max_age(0).max_uses(1).temporary(false).unique(true)
                         })
                         .await?;
 
-                    // Send invite
-                    ctx.say(
-                        "Please join the onboarding server here and run ``ibb!queue``: "
-                            .to_string()
-                            + &invite.url(),
-                    )
+                    // Create DM channel
+                    let user_id = UserId(user_id.parse::<u64>().unwrap());
+
+                    let dm_channel = user_id.create_dm_channel(discord).await?;
+
+                    // Send invite in DM
+                    dm_channel.send_message(discord, |m| {
+                        m.embed(|e| {
+                            e.title("Onboarding Server")
+                                .description("Click the link below to join the onboarding server. **This link is private**")
+                                .color(0x00ff00)
+                        })
+                        .components(|c| {
+                            c.create_action_row(|r| {
+                                r.create_button(|b| {
+                                    b.label("Join Onboarding Server")
+                                        .style(serenity::ButtonStyle::Link)
+                                        .url(&dm_invite.url())
+                                })
+                            })
+                        })
+                    })
                     .await?;
 
                     found = true;
@@ -167,39 +278,86 @@ pub async fn handle_onboarding(
         }
 
         if !found {
-            ctx.say(
-                "If the onboarding server still does not exist, please DM a Head Administrator",
-            )
-            .await?;
-
             let map = json!({
-                "name": onboard_name,
+                "name": user_id,
             });
 
             let new_guild = discord.http.create_guild(&map).await?;
 
-            // Create a channel
-            let channel = new_guild
+            let readme = new_guild
                 .create_channel(&discord, |c| {
-                    c.name("invite-attempt-".to_string() + &libavacado::public::gen_random(6))
+                    c.name("readme-")
                         .kind(serenity::model::channel::ChannelType::Text)
                 })
                 .await?;
 
-            // Create a invite
-            let invite = channel
+            readme.say(&discord, "
+Welcome to your onboarding server! Please read the following:
+
+1. To start onboarding, run ``ibb!onboard`` in the #general channel.
+2. There is a 1 hour time limit for onboarding. If you exceed this time limit, you will have to start over. You can extend this limit by progressing through onboarding.
+")
+                .await?;
+
+            // Create new invite for staff managers
+            let invite = readme
+                .create_invite(&discord, |i| {
+                    i.max_age(0).max_uses(0).temporary(false).unique(true)
+                })
+                .await?;
+
+            // Create DM invite
+            let dm_invite = readme
                 .create_invite(&discord, |i| {
                     i.max_age(0).max_uses(1).temporary(false).unique(true)
                 })
                 .await?;
 
+            // Create DM channel
+            let user_id = UserId(user_id.parse::<u64>().unwrap());
+
+            let dm_channel = user_id.create_dm_channel(discord).await?;
+
+            // Send invite in DM
+            dm_channel.send_message(discord, |m| {
+                        m.embed(|e| {
+                            e.title("Onboarding Server")
+                                .description("Click the link below to join the onboarding server. **This link is private**")
+                                .color(0x00ff00)
+                        })
+                        .components(|c| {
+                            c.create_action_row(|r| {
+                                r.create_button(|b| {
+                                    b.label("Join Onboarding Server")
+                                        .style(serenity::ButtonStyle::Link)
+                                        .url(&dm_invite.url())
+                                })
+                            })
+                        })
+                    })
+                    .await?;
+
+            let onboard_channel = std::env::var("ONBOARDING_CHANNEL").unwrap();
+
+            let channel = ChannelId(onboard_channel.parse::<u64>().unwrap());
+
             // Send invite
-            ctx.say(
-                "Please join the newly created onboarding server here and run ``ibb!onboard``: "
-                    .to_string()
-                    + &invite.url(),
-            )
-            .await?;
+            channel.send_message(discord, |m| {
+                        m.embed(|e| {
+                            e.title("Onboarding Server")
+                                .description("Click the link below to join the onboarding server if you want to as a staff manager do so.")
+                                .color(0x00ff00)
+                        })
+                        .components(|c| {
+                            c.create_action_row(|r| {
+                                r.create_button(|b| {
+                                    b.label("Join Onboarding Server")
+                                        .style(serenity::ButtonStyle::Link)
+                                        .url(&invite.url())
+                                })
+                            })
+                        })
+                    }).await?;
 
             return Ok(false);
         }
@@ -216,7 +374,7 @@ pub async fn handle_onboarding(
         for member in guild.members.iter() {
             // Resolve the users permissions
             if member.0 .0 == ctx.author().id.0 {
-                let permissions = member.1.permissions(&discord)?;
+                let permissions = member.1.permissions(discord)?;
                 if permissions.administrator() {
                     found = true;
                 }
@@ -263,7 +421,7 @@ pub async fn handle_onboarding(
                 role_id = Some(role.id);
             }
 
-            if role_id == None {
+            if role_id.is_none() {
                 ctx.say("Failed to fetch admin role").await?;
                 return Ok(false);
             }
@@ -286,30 +444,37 @@ pub async fn handle_onboarding(
         }
     }
 
-    if cmd_name == "staffguide" && onboard_state == "queue-step" {
-        // We are now in staff_onboard_state of staff-guide, set that
-        sqlx::query!(
-            "UPDATE users SET staff_onboard_state = 'staff-guide-viewed' WHERE user_id = $1",
-            user_id
-        )
-        .execute(&data.pool)
-        .await?;
-        return Ok(true);
-    }
-
     // Allow users to see queue again
-    if cmd_name == "queue" && !vec!["pending", "complete"].contains(&onboard_state) {
-        // Check that they are in stage 2 of queue command
-        if vec!["claimed-bot", "testing-bot"].contains(&onboard_state) {
+    match (onboard_state, cmd_name) {
+        ("claimed-bot" | "testing-bot", "queue") => {
             onboard_state = "claimed-bot";
-        } else {
+        }
+        (_, "queue") => {
             onboard_state = "queue-step";
         }
+        ("queue-step", "staffguide") => {
+            // We are now in staff_onboard_state of staff-guide, set that
+            sqlx::query!(
+                "UPDATE users SET staff_onboard_state = 'staff-guide-viewed' WHERE user_id = $1",
+                user_id
+            )
+            .execute(&data.pool)
+            .await?;
+            _handle_staff_guide(ctx, user_id.to_string()).await?;
+            return Ok(false);
+        }
+        (_, _) => {}
     }
 
     let test_bot = std::env::var("TEST_BOT")?;
     let bot_page = std::env::var("BOT_PAGE")?;
     let current_user = ctx.discord().cache.current_user();
+
+    if cmd_name == "claim" && reason != Some(&test_bot) {
+        ctx.say("You can only claim the test bot at this time!")
+            .await?;
+        return Ok(false);
+    }
 
     // Before matching, make sure 'Ninja Bot' is always pending
     sqlx::query!(
@@ -318,12 +483,6 @@ pub async fn handle_onboarding(
     )
     .execute(&data.pool)
     .await?;
-
-    if cmd_name == "claim" && reason != Some(&test_bot) {
-        ctx.say("You can only claim the test bot at this time!")
-            .await?;
-        return Ok(false);
-    }
 
     // Reset timer
     sqlx::query!(
@@ -372,16 +531,18 @@ pub async fn handle_onboarding(
             .execute(&data.pool)
             .await?;
 
-            ctx.say("Whoa there! Look at that! There's a new bot to review!!! Type ``/queue`` (or ``ibb!queue``) to see the queue").await?;
-
-            ctx.say("**PRO TIP:** This has a time limit of one hour. Progressing through onboarding or using testing commands properly will reset the timer. You will **not** be informed of when your time limit is close to expiry. Changing the name of the server will cause it to be *deleted*").await?;
+            ctx.say(r#"Whoa there! Look at that! There's a new bot to review!!! Type ``/queue`` (or ``ibb!queue``) to see the queue
+            
+**PRO TIP:** This has a time limit of one hour. Progressing through onboarding or using testing commands properly will reset the timer. You will **not** be informed of when your time limit is close to expiry. Changing the name of the server will cause it to be *deleted*
+            "#).await?;
 
             Ok(false)
         }
         "testing-bot" => {
             // Allow staff guide here
             if cmd_name == "staffguide" {
-                return Ok(true);
+                _handle_staff_guide(ctx, user_id.to_string()).await?;
+                return Ok(false);
             }
 
             if cmd_name != "approve" && cmd_name != "deny" {
@@ -393,8 +554,9 @@ pub async fn handle_onboarding(
             }
 
             // Get more information about this action by launching a modal using a button
-            let msg = ctx.send(|m| {
-                m.content("Are you sure that you truly wish to ".to_string() + cmd_name + " this test bot?  If so, click 'Survey' to launch the final onboarding survey.")
+
+            let mut msg = ctx.send(|m| {
+                m.content("Are you sure that you truly wish to ".to_string() + cmd_name + " this test bot?  If so, click 'Survey' to launch the final onboarding survey.\n\n**If you do not see a button, you will need to rerun the command.**")
                 .components(|c| {
                     c.create_action_row(|r| {
                         r.create_button(|b| {
@@ -417,10 +579,13 @@ pub async fn handle_onboarding(
             let interaction = msg
                 .await_component_interaction(ctx.discord())
                 .author_id(ctx.author().id)
+                .timeout(Duration::from_secs(120))
                 .await;
 
             if let Some(m) = &interaction {
                 let id = &m.data.custom_id;
+
+                msg.edit(ctx.discord(), |b| b.components(|b| b)).await?; // remove buttons after button press
 
                 if id == "survey" {
                     // Create a new message with the survey modal in it (via the button click)
@@ -447,6 +612,15 @@ pub async fn handle_onboarding(
                                         .placeholder("What did you think of the onboarding system? Your feedback will help us improve our services")
                                         .style(serenity::InputTextStyle::Paragraph)
                                     })
+                                });
+
+                                c.create_action_row(|r| {
+                                    r.create_input_text(|it| {
+                                        it.custom_id("code")
+                                        .label("Staff Verify Code")
+                                        .placeholder("You can find this by running the staffguide command")
+                                        .style(serenity::InputTextStyle::Short)
+                                    })
                                 })
                             })
                         })
@@ -455,15 +629,117 @@ pub async fn handle_onboarding(
                     // Wait for user to submit
                     let response = serenity::CollectModalInteraction::new(&discord.shard)
                         .author_id(m.user.id)
-                        .await
-                        .unwrap();
+                        .message_id(msg.id)
+                        .await;
 
-                    // Send acknowledgement so that the pop-up is closed
-                    response
-                        .create_interaction_response(discord, |b| {
-                            b.kind(serenity::InteractionResponseType::DeferredUpdateMessage)
-                        })
-                        .await?;
+                    if response.is_none() {
+                        ctx.say("You took too long to respond. Please try again.")
+                            .await?;
+                        return Ok(false);
+                    }
+
+                    let response = response.unwrap();
+
+                    // Verify the code
+                    let i_code = crate::_utils::modal_get(&response.data, "code").extract_single();
+
+                    if i_code.is_none() {
+                        response
+                            .create_interaction_response(&discord, |ir| {
+                                ir.interaction_response_data(|d| {
+                                    d.content("You did not provide a code. Please try again.")
+                                })
+                            })
+                            .await?;
+                        return Ok(false);
+                    }
+
+                    let i_code = i_code.unwrap().replace(' ', "");
+
+                    let code = sqlx::query!(
+                        "SELECT staff_onboard_session_code FROM users WHERE user_id = $1",
+                        user_id
+                    )
+                    .fetch_one(&data.pool)
+                    .await?;
+
+                    let code = code.staff_onboard_session_code;
+
+                    if code.is_none() {
+                        response.create_interaction_response(&discord, |ir| ir.interaction_response_data(|d| {
+                            d.content("SVSession has expired, rerun ``/staffguide`` (or ``ibb!staffguide``) to get a new verification code")
+                        })).await?;
+                        return Ok(false);
+                    }
+
+                    let code = code.unwrap();
+
+                    let codesplit = code.split('@').collect::<Vec<&str>>();
+
+                    if codesplit.len() != 2 {
+                        response.create_interaction_response(&discord, |ir| ir.interaction_response_data(|d| {
+                            d.content("SVSession has expired [invalid], rerun ``/staffguide`` (or ``ibb!staffguide``) to get a new verification code")
+                        })).await?;
+                        return Ok(false);
+                    }
+
+                    let time_nonce = codesplit[1];
+                    let time_nonce = time_nonce.parse::<i64>();
+
+                    if time_nonce.is_err() {
+                        response.create_interaction_response(&discord, |ir| ir.interaction_response_data(|d| {
+                            d.content("SVSession has expired [invalid], rerun ``/staffguide`` (or ``ibb!staffguide``) to get a new verification code")
+                        })).await?;
+                        return Ok(false);
+                    }
+
+                    let time_nonce = time_nonce.unwrap();
+
+                    // Get current time and subtract from time_nonce
+                    let now = chrono::Utc::now().timestamp();
+
+                    if now - time_nonce > 3600 {
+                        response.create_interaction_response(&discord, |ir| ir.interaction_response_data(|d| {
+                            d.content("SVSession has expired [invalid], rerun ``/staffguide`` (or ``ibb!staffguide``) to get a new verification code")
+                        })).await?;
+                        return Ok(false);
+                    }
+
+                    let code_web = codesplit[0];
+
+                    // Take last 37 characters
+                    let mut code_upper = code_web
+                        .chars()
+                        .skip(code_web.len() - 37)
+                        .collect::<String>();
+
+                    // Set index 2 and 19 to 'r' and 'x' respectively
+                    code_upper.replace_range(2..3, "r");
+                    code_upper.replace_range(19..20, "x");
+
+                    // SHA-512 it using ring
+                    let code_upper = code_upper.as_bytes();
+                    let code_upper = ring::digest::digest(&ring::digest::SHA512, code_upper);
+                    let code_upper = data_encoding::HEXLOWER.encode(code_upper.as_ref());
+
+                    // Get last 6 characters
+                    let code_upper = code_upper
+                        .chars()
+                        .skip(code_upper.len() - 6)
+                        .collect::<String>();
+
+                    info!("Wanted {} and user inputted {}", code_upper, i_code);
+
+                    if code_upper != i_code {
+                        response.create_interaction_response(&discord, |ir| ir.interaction_response_data(|d| {
+                            d.content("Whoa there! You inputted the wrong verification code (hint: ``/staffguide`` or ``ibb!staffguide``)")
+                        })).await?;
+                        return Ok(false);
+                    }
+
+                    response.create_interaction_response(&discord, |ir| ir.interaction_response_data(|d| {
+                        d.content("And the magic continues... Thank you for completing the staff onboarding process! You will be notified when you are approved. Please wait while I send your application to the staff team...")
+                    })).await?;
 
                     // Create permanent invite to this server
                     let channel = ctx.guild_id().unwrap().create_channel(discord, |c| {
@@ -487,14 +763,49 @@ This bot *will* now leave this server however you should not! Be prepared to sen
                         )
                     ).await?;
 
-                    let survey_modal = SurveyModal {
-                        analysis: crate::_utils::modal_get(&response.data, "analysis"),
-                        thoughts: crate::_utils::modal_get(&response.data, "thoughts"),
-                        has_onboarded_before: onboarded.staff_onboarded,
-                        invite: inv.url(),
-                    };
+                    let mut analysis =
+                        crate::_utils::modal_get(&response.data, "analysis").extract_single();
 
-                    let modal_raw = docser::serialize_docs(&survey_modal)?;
+                    if analysis.is_none() {
+                        analysis = Some("None".to_string());
+                    }
+
+                    let analysis = analysis.unwrap();
+
+                    let mut thoughts =
+                        crate::_utils::modal_get(&response.data, "thoughts").extract_single();
+
+                    if thoughts.is_none() {
+                        thoughts = Some("None".to_string());
+                    }
+
+                    let thoughts = thoughts.unwrap();
+
+                    let s_onboard = sqlx::query!(
+                        "SELECT staff_onboarded, staff_onboard_macro_time FROM users WHERE user_id = $1",
+                        user_id
+                    )
+                    .fetch_one(&data.pool)
+                    .await?;
+
+                    let survey_modal = json!({
+                        "analysis": analysis,
+                        "thoughts": thoughts,
+                        "invite": inv.url(),
+                        "submit_ts": chrono::Utc::now().timestamp(),
+                        "start_ts": s_onboard.staff_onboard_macro_time.unwrap_or_default().timestamp(),
+                        "staff_onboarded_before": s_onboard.staff_onboarded,
+                    });
+
+                    let tok = libavacado::public::gen_random(32);
+
+                    sqlx::query!("INSERT INTO onboard_data (user_id, onboard_code, data) VALUES ($1, $2, $3)", 
+                        user_id,
+                        tok,
+                        survey_modal
+                    )
+                    .execute(&data.pool)
+                    .await?;
 
                     // Now transfer ownership to author
                     ctx.guild_id()
@@ -502,57 +813,19 @@ This bot *will* now leave this server however you should not! Be prepared to sen
                         .edit(discord, |e| e.owner(ctx.author().id))
                         .await?;
 
-                    let tok = libavacado::public::gen_random(16);
-
                     let onboard_channel_id =
                         ChannelId(std::env::var("ONBOARDING_CHANNEL")?.parse::<u64>()?);
 
-                    onboard_channel_id.send_message(
+                    onboard_channel_id.say(
                         &discord,
-                        |m| {
-                            m.content(format!(
-                                "**Unique ID:** {tok} **New onboarding attempt**\n\n**User ID:** {user_id}\n**Action taken:** {action}\n**Overall reason:** {reason}.",
-                                user_id = user_id,
-                                action = cmd_name,
-                                reason = reason.unwrap_or_default(),
-                                tok = tok,
-                            ))
-                            .files(vec![serenity::AttachmentType::Bytes { data: modal_raw.as_bytes().into(), filename: "raw_data.md".to_string() }])
-                    }).await?;
-
-                    // Send model_raw but paginated
-                    let mut text_chunks = Vec::new();
-
-                    let mut text_chunk = String::new();
-                    for (i, c) in modal_raw.chars().enumerate() {
-                        text_chunk.push(c);
-                        if i % 1998 == 0 && i > 0 {
-                            text_chunks.push(text_chunk.clone());
-                            text_chunk.clear();
-                        }
-                    }
-
-                    for chunk in text_chunks {
-                        if !chunk.is_empty() {
-                            onboard_channel_id.say(discord, chunk).await?;
-                        }
-                    }
-
-                    // Empty buffer
-                    if !text_chunk.is_empty() {
-                        onboard_channel_id
-                            .say(discord, text_chunk)
-                            .await?
-                            .suppress_embeds(discord)
-                            .await?;
-                    }
-
-                    onboard_channel_id
-                        .say(
-                            discord,
-                            "**End of onboarding data for id ".to_string() + &tok + "**",
+                        format!(
+                            "**New onboarding attempt**\n\n**User ID:** {user_id}\n**Action taken:** {action}\n**Overall reason:** {reason}.\n**URL:** {url}",
+                            user_id = user_id,
+                            action = cmd_name,
+                            reason = reason.unwrap_or_default(),
+                            url = "https://seed.infinitybots.gg/sovngarde/onboard?tok=".to_string() + &tok
                         )
-                        .await?;
+                    ).await?;
 
                     sqlx::query!(
                         "UPDATE users SET staff_onboard_state = 'pending-manager-review' WHERE user_id = $1",
@@ -562,8 +835,13 @@ This bot *will* now leave this server however you should not! Be prepared to sen
                     .await?;
 
                     ctx.guild_id().unwrap().leave(discord).await?;
+
+                    return Ok(false);
                 } else {
-                    ctx.say("Cancelled").await?;
+                    m.create_interaction_response(&discord, |ir| {
+                        ir.interaction_response_data(|d| d.content("Cancelled"))
+                    })
+                    .await?;
                     return Ok(false);
                 }
             }
@@ -601,7 +879,10 @@ This bot *will* now leave this server however you should not! Be prepared to sen
 Great! As you can see, you have now claimed ``Ninja Bot``. 
                 
 Now test the bot as per the staff guide. Then run either ``/approve`` or ``/deny`` with your overall feeling of whether or not this bot should 
-be approved or denied."#).await?;
+be approved or denied.
+
+**Note that you will need to verify that you have read the staff guide when using ``/approve`` or ``/deny``.**
+"#).await?;
 
                 sqlx::query!(
                     "UPDATE users SET staff_onboard_state = 'testing-bot' WHERE user_id = $1",
@@ -610,7 +891,8 @@ be approved or denied."#).await?;
                 .execute(&data.pool)
                 .await?;
             } else if cmd_name == "staffguide" {
-                return Ok(true);
+                _handle_staff_guide(ctx, user_id.to_string()).await?;
+                return Ok(false);
             } else {
                 ctx.say("Type ``/queue`` now to see the queue.").await?;
             }
@@ -655,47 +937,40 @@ But before we get to reviewing it, lets have a look at the staff guide. You can 
         }
         // Not for us
         "staff-guide" => Ok(true),
-        "staff-guide-viewed" => Ok(true),
-        "staff-guide-read-encouraged" | "staff-guide-viewed-reminded" => {
+        "staff-guide-viewed" | "staff-guide-viewed-reminded" => {
             if cmd_name == "claim" {
                 let mut msg = ctx
                     .send(|m| {
                         m.embed(|e| {
-                            e.title("Bot Already Claimed");
-                            e.description(format!(
-                                "This bot is already claimed by <@{}>",
-                                current_user.id
-                            ));
-                            e.color(0xFF0000);
-                            e
-                        });
-
-                        m.components(|c| {
+                            e.title("Bot Already Claimed")
+                                .description(format!(
+                                    "This bot is already claimed by <@{}>",
+                                    current_user.id
+                                ))
+                                .color(0xFF0000)
+                        })
+                        .components(|c| {
                             c.create_action_row(|r| {
                                 r.create_button(|b| {
                                     b.custom_id("fclaim")
                                         .style(serenity::ButtonStyle::Primary)
                                         .label("Force Claim")
-                                        .disabled(onboard_state == "staff-guide-read-encouraged")
+                                        .disabled(onboard_state != "staff-guide-viewed-reminded")
                                 });
                                 r.create_button(|b| {
                                     b.custom_id("remind")
                                         .style(serenity::ButtonStyle::Secondary)
                                         .label("Remind Reviewer")
-                                        .disabled(onboard_state == "staff-guide-viewed-reminded")
+                                        .disabled(onboard_state != "staff-guide-viewed")
                                 })
-                            });
-
-                            c
-                        });
-
-                        m
+                            })
+                        })
                     })
                     .await?
                     .into_message()
                     .await?;
 
-                if onboard_state == "staff-guide-read-encouraged" {
+                if onboard_state != "staff-guide-viewed-reminded" {
                     ctx.say("Woah! This bot is already claimed by someone else. Its always best practice to first remind the bot so do that!").await?;
                 }
 
@@ -770,7 +1045,8 @@ But before we get to reviewing it, lets have a look at the staff guide. You can 
 
                 // Special override to allow revisiting the staffguide command
                 if cmd_name == "staffguide" {
-                    return Ok(true);
+                    _handle_staff_guide(ctx, user_id.to_string()).await?;
+                    return Ok(false);
                 }
             }
             Ok(false)
@@ -780,54 +1056,5 @@ But before we get to reviewing it, lets have a look at the staff guide. You can 
                 .await?;
             Ok(false)
         }
-    }
-}
-
-pub async fn post_command(ctx: crate::Context<'_>) -> Result<(), crate::Error> {
-    let cmd_name = &ctx.command().name;
-
-    info!("{}", cmd_name);
-
-    let data = ctx.data();
-
-    let onboard_state = {
-        let res = sqlx::query!(
-            "SELECT staff_onboard_state FROM users WHERE user_id = $1",
-            ctx.author().id.to_string()
-        )
-        .fetch_one(&data.pool)
-        .await?;
-
-        res.staff_onboard_state
-    };
-
-    let onboard_name = ctx.author().id.to_string();
-
-    let curr_guild = ctx.guild();
-
-    if let Some(guild) = curr_guild {
-        if guild.name != onboard_name {
-            return Ok(());
-        }
-    }
-
-    let onboard_state = onboard_state.as_str();
-
-    match onboard_state {
-        "staff-guide-viewed" => {
-            ctx.send(|m| {
-                m.content("Thats a lot isn't it? I'm glad you're ready to take on your first challenge. To get started, **invite ``Ninja Bot`` using ``ibb!invite [ID]`` where [ID] is the ID from the ``queue`` command**, then claim ``Ninja Bot``!")
-            }).await?;
-
-            sqlx::query!(
-                "UPDATE users SET staff_onboard_state = 'staff-guide-read-encouraged' WHERE user_id = $1",
-                ctx.author().id.to_string()
-            )
-            .execute(&data.pool)
-            .await?;
-
-            Ok(())
-        }
-        _ => Ok(()),
     }
 }

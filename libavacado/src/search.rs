@@ -6,24 +6,92 @@ use crate::public::{get_user, AvacadoPublic};
 
 use sqlx::PgPool;
 
+pub struct SearchFilter {
+    pub from: Option<i32>,
+    pub to: Option<i32>,
+}
+
+impl SearchFilter {
+    pub fn from(&self) -> i32 {
+        self.from.unwrap_or(-1)
+    }
+
+    pub fn to(&self) -> i32 {
+        self.to.unwrap_or(-1)
+    }
+}
+
+pub struct SearchOpts {
+    pub gc: SearchFilter,
+    pub votes: SearchFilter,
+    pub servers: SearchFilter,
+}
+
+impl SearchOpts {
+    /// Returns the cache key
+    pub fn key(&self) -> String {
+        format!(
+            ":{}-{}:{}-{}-{}-{}",
+            self.gc.from(),
+            self.gc.to(),
+            self.votes.from(),
+            self.votes.to(),
+            self.servers.from(),
+            self.servers.to()
+        )
+    }
+}
+
+/*
+Core search concepts:
+
+To add a filter:
+
+AND (bots.FIELD >= $N) -- FROM
+AND (($N+1 = -1) OR (bots.FIELD <= $N+1)) -- TO
+*/
+
 pub async fn search_bots(
     query: &String,
     pool: &PgPool,
     public: &AvacadoPublic,
+    opts: &SearchOpts,
 ) -> Result<Arc<Search>, Error> {
-    let search = public.search_cache.get(query);
+    let search = public.search_cache.get(&(query.to_string() + &opts.key()));
 
     if search.is_some() {
-        let search_inf = search.unwrap().clone();
-        return Ok(search_inf.into());
+        let search_inf = search.unwrap();
+        return Ok(search_inf);
     }
 
     let bots = sqlx::query!(
-        "SELECT DISTINCT bot_id, name, short, invite, servers, shards, votes, certified, tags FROM (
-            SELECT bot_id, owner, type, name, short, invite, servers, shards, votes, certified, tags, unnest(tags) AS tag_unnest FROM bots
-        ) bots WHERE type = 'approved' AND (name ILIKE $2 OR owner @@ $1 OR short @@ $1 OR tag_unnest @@ $1) ORDER BY votes DESC, certified DESC LIMIT 6",
+        "SELECT DISTINCT bot_id, clicks, invite_clicks, vanity, type, banner, name, short, invite, servers, shards, votes, certified, tags FROM (
+            SELECT bot_id, clicks, invite_clicks, vanity, owner, name, type, banner, short, invite, servers, shards, votes, certified, tags, unnest(tags) AS tag_unnest FROM bots
+        ) bots 
+        WHERE type = 'approved' 
+        AND (name ILIKE $2 OR owner @@ $1 OR short @@ $1 OR tag_unnest @@ $1) 
+
+        -- Guild count filter (3-4)
+        AND (servers >= $3)
+        AND (($4 = -1) OR (servers <= $4))
+
+        -- Votes filter (5-6)
+        AND (votes >= $5)
+        AND (($6 = -1) OR (votes <= $6))
+
+        -- Servers filter (7-8)
+        AND (servers >= $7)
+        AND (($8 = -1) OR (servers <= $8))
+
+        ORDER BY votes DESC, certified DESC LIMIT 6",
         query,
-        "%".to_string() + query + "%"
+        "%".to_string() + query + "%",
+        opts.gc.from(),
+        opts.gc.to(),
+        opts.votes.from(),
+        opts.votes.to(),
+        opts.servers.from(),
+        opts.servers.to()
     )
     .fetch_all(pool)
     .await?;
@@ -40,6 +108,11 @@ pub async fn search_bots(
             votes: bot.votes,
             certified: bot.certified,
             tags: bot.tags,
+            r#type: bot.r#type,
+            banner: bot.banner,
+            vanity: bot.vanity,
+            clicks: bot.clicks,
+            invite_clicks: bot.invite_clicks,
         });
     }
 
@@ -66,7 +139,7 @@ pub async fn search_bots(
 
         for bot in pack.bots {
             let res = sqlx::query!(
-                "SELECT bot_id, name, short, invite, servers, shards, votes, certified, tags FROM bots WHERE bot_id = $1",
+                "SELECT type, vanity, clicks, invite_clicks, banner, bot_id, name, short, invite, servers, shards, votes, certified, tags FROM bots WHERE bot_id = $1",
                 bot
             )
             .fetch_one(pool)
@@ -87,6 +160,11 @@ pub async fn search_bots(
                 votes: res.votes,
                 certified: res.certified,
                 tags: res.tags,
+                r#type: res.r#type,
+                banner: res.banner,
+                vanity: res.vanity,
+                clicks: res.clicks,
+                invite_clicks: res.invite_clicks,
             });
         }
     }
@@ -117,7 +195,10 @@ pub async fn search_bots(
         users: search_users,
     });
 
-    public.search_cache.insert(query.clone(), res.clone()).await;
+    public
+        .search_cache
+        .insert(query.to_string() + &opts.key(), res.clone())
+        .await;
 
     Ok(res)
 }
